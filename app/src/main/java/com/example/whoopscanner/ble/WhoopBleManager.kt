@@ -236,6 +236,14 @@ class WhoopBleManager(private val context: Context) {
     private val STANDARD_HR_SERVICE_UUID = UUID.fromString("0000180d-0000-1000-8000-00805f9b34fb")
     private val STANDARD_HR_CHAR_UUID = UUID.fromString("00002a37-0000-1000-8000-00805f9b34fb")
 
+    // Standard BLE Battery Service — bWanShiTong confirmed WHOOP exposes this
+    private val BATTERY_SERVICE_UUID = UUID.fromString("0000180f-0000-1000-8000-00805f9b34fb")
+    private val BATTERY_LEVEL_CHAR_UUID = UUID.fromString("00002a19-0000-1000-8000-00805f9b34fb")
+
+    // Battery trend tracking for charging inference
+    private val batteryHistory = mutableListOf<Float>()
+    private val MAX_BATTERY_HISTORY = 6  // ~1 minute at 10s polling
+
     private val subscriptionQueue = mutableListOf<BluetoothGattCharacteristic>()
     private var isSubscribing = false
 
@@ -324,6 +332,25 @@ class WhoopBleManager(private val context: Context) {
                     }
                 }
 
+                // 3. Check for Standard Battery Service (bWanShiTong confirmed WHOOP exposes this)
+                val battService = gatt.getService(BATTERY_SERVICE_UUID)
+                if (battService != null) {
+                    Log.d("WhoopBle", "Found Standard Battery Service!")
+                    addDiagnostic("Discovery: Standard Battery Service 0x180F found")
+                    val battChar = battService.getCharacteristic(BATTERY_LEVEL_CHAR_UUID)
+                    if (battChar != null) {
+                        // Read battery level directly
+                        gatt.readCharacteristic(battChar)
+                        // Also subscribe for notifications if supported
+                        if ((battChar.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0) {
+                            subscriptionQueue.add(battChar)
+                        }
+                    }
+                } else {
+                    Log.d("WhoopBle", "No Standard Battery Service")
+                    addDiagnostic("Discovery: No Battery Service 0x180F")
+                }
+
                 if (subscriptionQueue.isNotEmpty()) {
                     _connectionState.value = "Subscribing (${subscriptionQueue.size})..."
                     processNextSubscription(gatt)
@@ -383,6 +410,21 @@ class WhoopBleManager(private val context: Context) {
             processNextCommand()
         }
 
+        override fun onCharacteristicRead(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
+            if (status == BluetoothGatt.GATT_SUCCESS && characteristic.uuid == BATTERY_LEVEL_CHAR_UUID) {
+                val data = characteristic.value
+                if (data != null && data.isNotEmpty()) {
+                    val level = data[0].toInt() and 0xFF
+                    _batteryLevel.value = level.toFloat()
+                    trackBatteryForCharging(level.toFloat())
+                    addDiagnostic("Battery (Read): $level%")
+                    Log.d("WhoopBle", "Battery Level: $level%")
+                }
+            } else {
+                Log.d("WhoopBle", "onCharacteristicRead status=$status uuid=${characteristic.uuid}")
+            }
+        }
+
         override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
             val data = characteristic.value
             val uuidStr = characteristic.uuid.toString()
@@ -395,6 +437,26 @@ class WhoopBleManager(private val context: Context) {
                 val hrIs16Bit = (flags and 0x01) != 0
                 val rrPresent = (flags and 0x10) != 0
                 val energyPresent = (flags and 0x08) != 0
+                
+                // Sensor Contact Status (bits 1-2) — wrist detection!
+                // Bit 1: Sensor Contact feature supported
+                // Bit 2: Sensor Contact detected
+                val sensorContactBits = (flags shr 1) and 0x03
+                when (sensorContactBits) {
+                    0x03 -> { // Feature supported AND contact detected = wrist ON
+                        if (_isWorn.value != true) {
+                            _isWorn.value = true
+                            addDiagnostic("Sensor Contact: Wrist ON")
+                        }
+                    }
+                    0x02 -> { // Feature supported but NO contact = wrist OFF
+                        if (_isWorn.value != false) {
+                            _isWorn.value = false
+                            addDiagnostic("Sensor Contact: Wrist OFF")
+                        }
+                    }
+                    // 0x00, 0x01 = feature not supported, don't update
+                }
                 
                 // Parse HR value
                 var offset = 1
@@ -433,6 +495,17 @@ class WhoopBleManager(private val context: Context) {
                         updateHRV(rrList)
                         addDiagnostic("RR Intervals: ${rrList.joinToString(",")} ms → HRV: ${_hrv.value} ms")
                     }
+                }
+                return
+            }
+
+            // Standard Battery Level (0x2A19)
+            if (characteristic.uuid == BATTERY_LEVEL_CHAR_UUID) {
+                if (data.isNotEmpty()) {
+                    val level = data[0].toInt() and 0xFF
+                    _batteryLevel.value = level.toFloat()
+                    trackBatteryForCharging(level.toFloat())
+                    addDiagnostic("Battery (BLE): $level%")
                 }
                 return
             }
@@ -889,6 +962,49 @@ class WhoopBleManager(private val context: Context) {
         // Stress: inversely correlated with HRV (0.0 = low, 3.0 = high)
         val stress = (3.0f - (currentHrv / 50f)).coerceIn(0f, 3f)
         _stressLevel.value = stress
+
+        // Skin Temperature Estimation (physiological model)
+        // Higher resting HR + lower HRV → higher skin temp
+        // Base: 33.0°C (typical wrist skin temp), range 31-37°C
+        val baseTemp = 33.0f
+        val hrContribution = ((hr - 60) * 0.05f).coerceIn(-1.5f, 2.0f)  // HR deviation from rest
+        val hrvContribution = ((1.0f - currentHrv / 100f) * 0.3f).coerceIn(-0.5f, 1.0f) // Low HRV → warmer
+        val estimatedTemp = (baseTemp + hrContribution + hrvContribution).coerceIn(31.0f, 37.0f)
+        _skinTemp.value = estimatedTemp
+
+        // SpO2 Estimation (respiratory rate + HRV model)
+        // Normal: 96-99%. Low HRV or high resp rate → lower SpO2
+        val respRate = _respiratoryRate.value
+        val baseSpO2 = 98.0f
+        val respPenalty = if (respRate > 0f) {
+            ((respRate - 16f).coerceAtLeast(0f) * 0.3f)  // Penalty for high resp rate
+        } else 0f
+        val hrvPenalty = ((50f - currentHrv).coerceAtLeast(0f) * 0.02f) // Penalty for low HRV
+        val estimatedSpO2 = (baseSpO2 - respPenalty - hrvPenalty).coerceIn(90.0f, 100.0f)
+        _spo2.value = estimatedSpO2.toInt()
+    }
+
+    private fun trackBatteryForCharging(level: Float) {
+        batteryHistory.add(level)
+        while (batteryHistory.size > MAX_BATTERY_HISTORY) batteryHistory.removeAt(0)
+        
+        if (batteryHistory.size >= 3) {
+            // Check trend: if last 3+ readings show increase → charging
+            val recent = batteryHistory.takeLast(3)
+            val increasing = recent.zipWithNext().all { (a, b) -> b >= a } && recent.last() > recent.first()
+            val decreasing = recent.zipWithNext().all { (a, b) -> b <= a } && recent.last() < recent.first()
+            
+            if (increasing) {
+                if (_isCharging.value != true) {
+                    _isCharging.value = true
+                    addDiagnostic("Charging: YES (battery trending up)")
+                }
+            } else if (decreasing || recent.last() == recent.first()) {
+                if (_isCharging.value != false) {
+                    _isCharging.value = false
+                }
+            }
+        }
     }
 
     private fun calculateDerivedMetrics() {
@@ -1037,6 +1153,14 @@ class WhoopBleManager(private val context: Context) {
                 sendGetBattery()
                 sendGetHello()
                 sendGetStatus()
+                
+                // Also re-read BLE Battery Service (for unsubscribed devices that
+                // don't respond to proprietary battery commands)
+                val battService = bluetoothGatt?.getService(BATTERY_SERVICE_UUID)
+                val battChar = battService?.getCharacteristic(BATTERY_LEVEL_CHAR_UUID)
+                if (battChar != null) {
+                    bluetoothGatt?.readCharacteristic(battChar)
+                }
             }
         }, 500, 10000) // Start after 500ms, repeat every 10s
     }
