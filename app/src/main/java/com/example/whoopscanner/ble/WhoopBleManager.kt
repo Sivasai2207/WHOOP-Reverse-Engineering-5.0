@@ -1048,9 +1048,17 @@ class WhoopBleManager(private val context: Context) {
 
     @SuppressLint("MissingPermission")
     fun connect(device: BluetoothDevice) {
+        stopScan() // CRITICAL: Must stop scanning before connecting to avoid GATT 133 errors
         _connectionState.value = "Connecting..."
         _deviceName.value = device.name ?: "Unknown Device" // Update name
-        bluetoothGatt = device.connectGatt(context, false, gattCallback)
+        
+        if (device.bondState == BluetoothDevice.BOND_NONE) {
+            Log.d("WhoopBle", "Device not bonded, creating bond...")
+            device.createBond()
+        }
+        
+        // Use TRANSPORT_LE for robust BLE connection
+        bluetoothGatt = device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
     }
 
     fun enableAllSensors() {
@@ -1170,15 +1178,33 @@ class WhoopBleManager(private val context: Context) {
         pollingJob = null
     }
     
+    private var scanCallback: android.bluetooth.le.ScanCallback? = null
+
+    fun stopScan() {
+        if (scanCallback != null) {
+            bluetoothAdapter?.bluetoothLeScanner?.stopScan(scanCallback)
+            scanCallback = null
+            Log.d("WhoopBle", "Scan stopped")
+        }
+    }
+
     fun scan(onDeviceFound: (BluetoothDevice) -> Unit) {
+        stopScan() // Ensure previous scan is stopped
+        
         val scanner = bluetoothAdapter?.bluetoothLeScanner
-        scanner?.startScan(object : android.bluetooth.le.ScanCallback() {
+        scanCallback = object : android.bluetooth.le.ScanCallback() {
             override fun onScanResult(callbackType: Int, result: android.bluetooth.le.ScanResult) {
                 val device = result.device
                 if (device.name != null && device.name.contains("Whoop", ignoreCase = true)) {
                     onDeviceFound(device)
                 }
             }
-        })
+            
+            override fun onScanFailed(errorCode: Int) {
+                Log.e("WhoopBle", "Scan failed: $errorCode")
+            }
+        }
+        scanner?.startScan(scanCallback)
+        Log.d("WhoopBle", "Scan started")
     }
 }
