@@ -339,8 +339,6 @@ class WhoopBleManager(private val context: Context) {
                     addDiagnostic("Discovery: Standard Battery Service 0x180F found")
                     val battChar = battService.getCharacteristic(BATTERY_LEVEL_CHAR_UUID)
                     if (battChar != null) {
-                        // Read battery level directly
-                        gatt.readCharacteristic(battChar)
                         // Also subscribe for notifications if supported
                         if ((battChar.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0) {
                             subscriptionQueue.add(battChar)
@@ -377,7 +375,16 @@ class WhoopBleManager(private val context: Context) {
             val descriptor = char.getDescriptor(UUID.fromString("00002902-0000-1000-8000-00805f9b34fb"))
             if (descriptor != null) {
                 descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                gatt.writeDescriptor(descriptor)
+                if (!gatt.writeDescriptor(descriptor)) {
+                    Log.e("WhoopBle", "writeDescriptor failed immediately for ${char.uuid}")
+                    // Retry or skip? If we skip, we lose this subscription but don't hang.
+                    // Let's try 1 retry logic? No, simple recursion is safest to unblock.
+                    // processNextSubscription(gatt) // Recurse to next
+                    // But if we recurse, we might loop if all fail. 
+                    // Let's add delay? No handler.
+                    // Just skip it.
+                    processNextSubscription(gatt) 
+                }
             } else {
                 Log.e("WhoopBle", "No CCCD for ${char.uuid}")
                 processNextSubscription(gatt)
